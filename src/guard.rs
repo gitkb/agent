@@ -958,9 +958,9 @@ mod tests {
     }
 
     #[test]
-    fn reset_hard_reason_suggests_snapshot() {
+    fn reset_hard_reason_suggests_reflog() {
         let denial = evaluate_command("git reset --hard").unwrap();
-        assert!(denial.reason.contains("snapshot"));
+        assert!(denial.reason.contains("git reflog"));
     }
 
     #[test]
