@@ -57,7 +57,7 @@ echo '{"tool_input":{"command":"git status"}}' | agent guard
 | Pattern | What it blocks | Safe alternative |
 |---------|----------------|------------------|
 | `git push --force` | Force push | `--force-with-lease` |
-| `git reset --hard` | Hard reset | `git stash` or snapshot |
+| `git reset --hard` | Hard reset | `git stash` or commit first; `git reflog` |
 | `git clean -fd` | Clean force | `git clean -nd` (dry run) |
 | `git checkout .` | Checkout all | Specific files |
 | `git branch -D` | Force delete branch | `git branch -d` |

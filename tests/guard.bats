@@ -80,7 +80,7 @@ setup() {
     run bash -c 'echo '"'"'{"tool_input":{"command":"git reset --hard"}}'"'"' | '"$AGENT_BIN"' guard'
     [ "$status" -eq 0 ]
     [[ "$output" == *"deny"* ]]
-    [[ "$output" == *"snapshot"* ]]
+    [[ "$output" == *"git reflog"* ]]
 }
 
 @test "guard denies git clean -fd" {
