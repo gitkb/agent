@@ -85,7 +85,6 @@ agent score --json
 **Metrics:**
 - Meta-command ratio (using `meta git` vs bare `git`)
 - Workspace discovery (running `meta context` early)
-- Snapshot safety (snapshots before destructive ops)
 - Cross-repo awareness (status checks before commits)
 - Guard effectiveness (blocked vs allowed destructive commands)
 

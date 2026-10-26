@@ -2,7 +2,7 @@
 //!
 //! Analyzes transcript files from `~/.claude/projects/{PROJECT_HASH}/` and computes
 //! metrics on how well agents use meta tools: meta-command ratio, workspace discovery,
-//! snapshot safety, cross-repo awareness, and guard effectiveness.
+//! cross-repo awareness, and guard effectiveness.
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -197,15 +197,11 @@ pub struct SessionMetrics {
     // Metric 2: Workspace discovery
     pub workspace_discovery_rank: Option<usize>,
 
-    // Metric 3: Snapshot safety
-    pub destructive_ops_detected: usize,
-    pub snapshots_before_destructive: usize,
-
-    // Metric 4: Cross-repo awareness
+    // Metric 3: Cross-repo awareness
     pub commits_attempted: usize,
     pub meta_status_before_commit: Vec<usize>,
 
-    // Metric 5: Guard effectiveness (placeholder - requires hook logs)
+    // Metric 4: Guard effectiveness (placeholder - requires hook logs)
     pub destructive_blocked: usize,
     pub destructive_allowed: usize,
 }
@@ -227,7 +223,6 @@ pub fn parse_and_score(transcript_path: &Path) -> Result<SessionMetrics> {
 
     let mut metrics = SessionMetrics::default();
     let mut call_rank = 0;
-    let mut last_snapshot_rank: Option<usize> = None;
 
     for line in reader.lines() {
         let line = line?;
@@ -265,7 +260,6 @@ pub fn parse_and_score(transcript_path: &Path) -> Result<SessionMetrics> {
                                     call_rank,
                                     timestamp.clone(),
                                     &mut metrics,
-                                    &mut last_snapshot_rank,
                                 );
                             }
                         }
@@ -283,7 +277,6 @@ fn process_bash_command(
     rank: usize,
     timestamp: String,
     metrics: &mut SessionMetrics,
-    last_snapshot_rank: &mut Option<usize>,
 ) {
     let is_git = command.contains("git");
     let is_meta_git = command.starts_with("meta git") || command.contains(" meta git ");
@@ -304,22 +297,7 @@ fn process_bash_command(
         metrics.workspace_discovery_rank = Some(rank);
     }
 
-    // Metric 3: Snapshot safety
-    if command.contains("meta git snapshot create") {
-        *last_snapshot_rank = Some(rank);
-    }
-
-    if is_destructive {
-        metrics.destructive_ops_detected += 1;
-        // Check if there's a recent snapshot protecting this op
-        if let Some(snapshot_rank) = last_snapshot_rank {
-            if *snapshot_rank < rank && (rank - *snapshot_rank) <= 5 {
-                metrics.snapshots_before_destructive += 1;
-            }
-        }
-    }
-
-    // Metric 4: Cross-repo awareness
+    // Metric 3: Cross-repo awareness
     if command.contains("meta git status") || command.contains("meta git diff") {
         metrics.meta_status_before_commit.push(rank);
     }
@@ -328,7 +306,7 @@ fn process_bash_command(
         metrics.commits_attempted += 1;
     }
 
-    // Metric 5: Guard effectiveness (placeholder - requires hook log parsing)
+    // Metric 4: Guard effectiveness (placeholder - requires hook log parsing)
     // This would need to parse hook denial messages from transcript, deferred for now
 
     metrics.bash_commands.push(BashCommand {
@@ -365,9 +343,6 @@ pub struct SessionScore {
 
     pub workspace_discovery_score: f64,
     pub workspace_discovery_grade: Grade,
-
-    pub snapshot_safety_score: f64,
-    pub snapshot_safety_grade: Grade,
 
     pub cross_repo_awareness_score: f64,
     pub cross_repo_awareness_grade: Grade,
@@ -431,15 +406,7 @@ pub fn compute_score(metrics: SessionMetrics) -> SessionScore {
     };
     let discovery_grade = Grade::from_score(discovery_score);
 
-    // Metric 3: Snapshot safety (target: 100%)
-    let snapshot_score = if metrics.destructive_ops_detected > 0 {
-        metrics.snapshots_before_destructive as f64 / metrics.destructive_ops_detected as f64
-    } else {
-        1.0 // No destructive ops = perfect
-    };
-    let snapshot_grade = Grade::from_score(snapshot_score);
-
-    // Metric 4: Cross-repo awareness (target: > 90%)
+    // Metric 3: Cross-repo awareness (target: > 90%)
     let awareness_score = if metrics.commits_attempted > 0 {
         let commit_ranks: Vec<usize> = metrics
             .bash_commands
@@ -466,7 +433,7 @@ pub fn compute_score(metrics: SessionMetrics) -> SessionScore {
     };
     let awareness_grade = Grade::from_score(awareness_score);
 
-    // Metric 5: Guard effectiveness (placeholder - requires hook logs)
+    // Metric 4: Guard effectiveness (placeholder - requires hook logs)
     let guard_total = metrics.destructive_blocked + metrics.destructive_allowed;
     let guard_score = if guard_total > 0 {
         metrics.destructive_blocked as f64 / guard_total as f64
@@ -475,22 +442,14 @@ pub fn compute_score(metrics: SessionMetrics) -> SessionScore {
     };
     let guard_grade = Grade::from_score(guard_score);
 
-    // Overall grade: weighted average
-    let overall = (meta_ratio * 0.25)
-        + (discovery_score * 0.20)
-        + (snapshot_score * 0.25)
-        + (awareness_score * 0.20)
-        + (guard_score * 0.10);
+    // Overall grade: weighted average, 5:4:4:2 (≈ 33/27/27/13%)
+    let overall =
+        (meta_ratio * 5.0 + discovery_score * 4.0 + awareness_score * 4.0 + guard_score * 2.0)
+            / 15.0;
     let overall_grade = Grade::from_score(overall);
 
     // Generate suggestions
-    let suggestions = generate_suggestions(
-        &metrics,
-        meta_ratio,
-        discovery_score,
-        snapshot_score,
-        awareness_score,
-    );
+    let suggestions = generate_suggestions(&metrics, meta_ratio, discovery_score, awareness_score);
 
     SessionScore {
         session_id: metrics.session_id.clone(),
@@ -499,8 +458,6 @@ pub fn compute_score(metrics: SessionMetrics) -> SessionScore {
         meta_command_grade: meta_grade,
         workspace_discovery_score: discovery_score,
         workspace_discovery_grade: discovery_grade,
-        snapshot_safety_score: snapshot_score,
-        snapshot_safety_grade: snapshot_grade,
         cross_repo_awareness_score: awareness_score,
         cross_repo_awareness_grade: awareness_grade,
         guard_effectiveness_score: guard_score,
@@ -514,7 +471,6 @@ fn generate_suggestions(
     metrics: &SessionMetrics,
     meta_ratio: f64,
     discovery_score: f64,
-    snapshot_score: f64,
     awareness_score: f64,
 ) -> Vec<String> {
     let mut suggestions = Vec::new();
@@ -540,15 +496,6 @@ fn generate_suggestions(
                 ));
             }
         }
-    }
-
-    if snapshot_score < 0.95 && metrics.destructive_ops_detected > 0 {
-        let unprotected = metrics.destructive_ops_detected - metrics.snapshots_before_destructive;
-        suggestions.push(format!(
-            "Only {}/{} destructive operations were preceded by snapshots ({unprotected} unprotected). Use `meta git snapshot create` before batch changes.",
-            metrics.snapshots_before_destructive,
-            metrics.destructive_ops_detected
-        ));
     }
 
     if awareness_score < 0.95 && metrics.commits_attempted > 0 {
@@ -579,27 +526,22 @@ pub fn format_markdown(score: &SessionScore) -> String {
     out.push_str("| Metric | Score | Grade | Weight |\n");
     out.push_str("|--------|-------|-------|--------|\n");
     out.push_str(&format!(
-        "| Meta-command ratio | {:.0}% | {} | 25% |\n",
+        "| Meta-command ratio | {:.0}% | {} | 33% |\n",
         score.meta_command_ratio * 100.0,
         score.meta_command_grade.display()
     ));
     out.push_str(&format!(
-        "| Workspace discovery | {:.0}% | {} | 20% |\n",
+        "| Workspace discovery | {:.0}% | {} | 27% |\n",
         score.workspace_discovery_score * 100.0,
         score.workspace_discovery_grade.display()
     ));
     out.push_str(&format!(
-        "| Snapshot safety | {:.0}% | {} | 25% |\n",
-        score.snapshot_safety_score * 100.0,
-        score.snapshot_safety_grade.display()
-    ));
-    out.push_str(&format!(
-        "| Cross-repo awareness | {:.0}% | {} | 20% |\n",
+        "| Cross-repo awareness | {:.0}% | {} | 27% |\n",
         score.cross_repo_awareness_score * 100.0,
         score.cross_repo_awareness_grade.display()
     ));
     out.push_str(&format!(
-        "| Guard effectiveness | {:.0}% | {} | 10% |\n\n",
+        "| Guard effectiveness | {:.0}% | {} | 13% |\n\n",
         score.guard_effectiveness_score * 100.0,
         score.guard_effectiveness_grade.display()
     ));
@@ -611,10 +553,6 @@ pub fn format_markdown(score: &SessionScore) -> String {
         score.metrics.total_git_commands,
         score.metrics.meta_git_commands,
         score.metrics.total_git_commands - score.metrics.meta_git_commands
-    ));
-    out.push_str(&format!(
-        "- Destructive ops: {} ({} protected)\n",
-        score.metrics.destructive_ops_detected, score.metrics.snapshots_before_destructive
     ));
     out.push_str(&format!(
         "- Commits: {}\n\n",
@@ -654,14 +592,12 @@ mod tests {
     #[test]
     fn test_meta_command_detection() {
         let mut metrics = SessionMetrics::default();
-        let mut last_snapshot = None;
 
         process_bash_command(
             "meta git status",
             1,
             "2026-01-27T00:00:00Z".to_string(),
             &mut metrics,
-            &mut last_snapshot,
         );
         assert_eq!(metrics.total_git_commands, 1);
         assert_eq!(metrics.meta_git_commands, 1);
@@ -671,7 +607,6 @@ mod tests {
             2,
             "2026-01-27T00:00:01Z".to_string(),
             &mut metrics,
-            &mut last_snapshot,
         );
         assert_eq!(metrics.total_git_commands, 2);
         assert_eq!(metrics.meta_git_commands, 1);
@@ -680,14 +615,12 @@ mod tests {
     #[test]
     fn test_workspace_discovery_early() {
         let mut metrics = SessionMetrics::default();
-        let mut last_snapshot = None;
 
         process_bash_command(
             "meta context",
             2,
             "2026-01-27T00:00:00Z".to_string(),
             &mut metrics,
-            &mut last_snapshot,
         );
         assert_eq!(metrics.workspace_discovery_rank, Some(2));
     }
@@ -702,36 +635,19 @@ mod tests {
     }
 
     #[test]
-    fn test_snapshot_protection() {
-        let mut metrics = SessionMetrics::default();
-        let mut last_snapshot = None;
-
-        // Create snapshot
-        process_bash_command(
-            "meta git snapshot create before-refactor",
-            1,
-            "2026-01-27T00:00:00Z".to_string(),
-            &mut metrics,
-            &mut last_snapshot,
-        );
-
-        // Destructive op within 5 calls - should be protected
-        process_bash_command(
-            "git reset --hard HEAD~1",
-            3,
-            "2026-01-27T00:00:01Z".to_string(),
-            &mut metrics,
-            &mut last_snapshot,
-        );
-
-        assert_eq!(metrics.destructive_ops_detected, 1);
-        assert_eq!(metrics.snapshots_before_destructive, 1);
+    fn test_overall_weights() {
+        // Only bare git: (0*5 + 4 + 4 + 2) / 15 ≈ 0.67 → D
+        let metrics = SessionMetrics {
+            total_git_commands: 1,
+            workspace_discovery_rank: Some(1),
+            ..Default::default()
+        };
+        assert_eq!(compute_score(metrics).overall_grade, Grade::D);
     }
 
     #[test]
     fn test_cross_repo_awareness() {
         let mut metrics = SessionMetrics::default();
-        let mut last_snapshot = None;
 
         // meta status
         process_bash_command(
@@ -739,7 +655,6 @@ mod tests {
             5,
             "2026-01-27T00:00:00Z".to_string(),
             &mut metrics,
-            &mut last_snapshot,
         );
 
         // commit within 10 calls - protected
@@ -748,7 +663,6 @@ mod tests {
             8,
             "2026-01-27T00:00:01Z".to_string(),
             &mut metrics,
-            &mut last_snapshot,
         );
 
         assert_eq!(metrics.commits_attempted, 1);
