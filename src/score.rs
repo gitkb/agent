@@ -37,8 +37,19 @@ pub fn handle_score(
             eprintln!("Parsing: {}", session_path.display());
         }
         let metrics = parse_and_score(session_path)?;
-        let score = compute_score(metrics);
-        scores.push(score);
+        if metrics.assistant_messages == 0 {
+            eprintln!(
+                "Not scoring {}: no assistant messages could be read ({} unreadable lines)",
+                session_path.display(),
+                metrics.skipped_lines
+            );
+            continue;
+        }
+        scores.push(compute_score(metrics));
+    }
+
+    if scores.is_empty() {
+        anyhow::bail!("No readable sessions to score");
     }
 
     if json {
@@ -65,7 +76,7 @@ pub struct SessionFinder {
 impl SessionFinder {
     /// Create a finder for the given project path.
     ///
-    /// Project hash is computed as the absolute path with `/` replaced by `-`.
+    /// Project hash is the absolute path with every non-alphanumeric character replaced by `-`.
     pub fn new(project_path: &Path) -> Result<Self> {
         let abs_path = project_path
             .canonicalize()
@@ -91,9 +102,13 @@ impl SessionFinder {
         })
     }
 
-    /// Compute project hash: replace `/` with `-` in absolute path.
+    /// Compute project hash the way Claude Code names project dirs: every
+    /// character other than an ASCII letter or digit becomes `-`.
     fn compute_project_hash(path: &Path) -> String {
-        path.to_string_lossy().replace('/', "-")
+        path.to_string_lossy()
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+            .collect()
     }
 
     /// Find the N most recent session transcripts (sorted by modified time).
@@ -134,18 +149,13 @@ impl SessionFinder {
 // ── JSONL Transcript Parsing ────────────────────────────
 
 /// A single line from a Claude Code JSONL transcript.
-#[derive(Debug, Clone, Deserialize)]
+///
+/// Only the fields the scorer uses are declared; serde ignores the rest, and
+/// any other line type (user, attachment, mode, ...) parses as `Other`.
+#[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 enum TranscriptEntry {
-    User {
-        _uuid: String,
-        #[serde(rename = "sessionId")]
-        _session_id: String,
-        _timestamp: String,
-        _message: Message,
-    },
     Assistant {
-        _uuid: String,
         #[serde(rename = "sessionId")]
         session_id: String,
         timestamp: String,
@@ -155,27 +165,17 @@ enum TranscriptEntry {
     Other,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Deserialize)]
 struct Message {
-    _role: String,
-    content: serde_json::Value,
+    content: Vec<ContentBlock>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum ContentBlock {
-    Text {
-        _text: String,
-    },
     ToolUse {
-        _id: String,
         name: String,
         input: serde_json::Value,
-    },
-    ToolResult {
-        _tool_use_id: String,
-        _content: serde_json::Value,
-        _is_error: Option<bool>,
     },
     #[serde(other)]
     Other,
@@ -187,6 +187,8 @@ enum ContentBlock {
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct SessionMetrics {
     pub session_id: String,
+    pub assistant_messages: usize,
+    pub skipped_lines: usize,
     pub tool_calls: usize,
     pub bash_commands: Vec<BashCommand>,
 
@@ -232,36 +234,34 @@ pub fn parse_and_score(transcript_path: &Path) -> Result<SessionMetrics> {
 
         let entry: TranscriptEntry = match serde_json::from_str(&line) {
             Ok(e) => e,
-            Err(_) => continue, // Skip malformed lines gracefully
+            Err(_) => {
+                metrics.skipped_lines += 1;
+                continue;
+            }
         };
 
         if let TranscriptEntry::Assistant {
             message,
             session_id,
             timestamp,
-            ..
         } = entry
         {
             metrics.session_id = session_id;
+            metrics.assistant_messages += 1;
 
-            // Parse content as array of ContentBlock
-            if let Ok(content_array) =
-                serde_json::from_value::<Vec<ContentBlock>>(message.content.clone())
-            {
-                for content in content_array {
-                    if let ContentBlock::ToolUse { name, input, .. } = content {
-                        if name == "Bash" {
-                            call_rank += 1;
-                            metrics.tool_calls += 1;
+            for content in message.content {
+                if let ContentBlock::ToolUse { name, input } = content {
+                    if name == "Bash" {
+                        call_rank += 1;
+                        metrics.tool_calls += 1;
 
-                            if let Some(command) = input.get("command").and_then(|v| v.as_str()) {
-                                process_bash_command(
-                                    command,
-                                    call_rank,
-                                    timestamp.clone(),
-                                    &mut metrics,
-                                );
-                            }
+                        if let Some(command) = input.get("command").and_then(|v| v.as_str()) {
+                            process_bash_command(
+                                command,
+                                call_rank,
+                                timestamp.clone(),
+                                &mut metrics,
+                            );
                         }
                     }
                 }
@@ -554,10 +554,14 @@ pub fn format_markdown(score: &SessionScore) -> String {
         score.metrics.meta_git_commands,
         score.metrics.total_git_commands - score.metrics.meta_git_commands
     ));
-    out.push_str(&format!(
-        "- Commits: {}\n\n",
-        score.metrics.commits_attempted
-    ));
+    out.push_str(&format!("- Commits: {}\n", score.metrics.commits_attempted));
+    if score.metrics.skipped_lines > 0 {
+        out.push_str(&format!(
+            "- Unreadable transcript lines skipped: {}\n",
+            score.metrics.skipped_lines
+        ));
+    }
+    out.push('\n');
 
     out.push_str("## Suggestions\n\n");
     for suggestion in &score.suggestions {
@@ -578,6 +582,39 @@ mod tests {
         let path = Path::new("/Users/matt/development/meta");
         let hash = SessionFinder::compute_project_hash(path);
         assert_eq!(hash, "-Users-matt-development-meta");
+
+        let path = Path::new("/home/gsc/code/gitkb-dev/harmony/.worktrees/my_task");
+        let hash = SessionFinder::compute_project_hash(path);
+        assert_eq!(hash, "-home-gsc-code-gitkb-dev-harmony--worktrees-my-task");
+    }
+
+    #[test]
+    fn test_parse_real_transcript_format() {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/transcript.jsonl");
+        let metrics = parse_and_score(&fixture).unwrap();
+
+        assert_eq!(metrics.session_id, "fixture-session");
+        assert_eq!(metrics.skipped_lines, 1);
+        assert_eq!(metrics.tool_calls, 4);
+        let commands: Vec<&str> = metrics
+            .bash_commands
+            .iter()
+            .map(|c| c.command.as_str())
+            .collect();
+        assert_eq!(
+            commands,
+            [
+                "meta context",
+                "git status",
+                "meta git status",
+                "git commit -m 'fix: fixture'"
+            ]
+        );
+        assert_eq!(metrics.total_git_commands, 3);
+        assert_eq!(metrics.meta_git_commands, 1);
+        assert_eq!(metrics.workspace_discovery_rank, Some(1));
+        assert_eq!(metrics.commits_attempted, 1);
+        assert_eq!(compute_score(metrics).cross_repo_awareness_score, 1.0);
     }
 
     #[test]
