@@ -6,6 +6,9 @@ license = "MIT"
 repository = "https://github.com/gitkb/agent"
 description = "Claude Code agent toolkit: guard, score, and more"
 
+[lints.rust]
+unsafe_code = "forbid"
+
 [dependencies]
 anyhow = "1.0"
 clap = { version = "4.3", features = ["derive"] }
