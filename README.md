@@ -113,6 +113,8 @@ message = "This command is blocked because..."
 - `validator`: Optional additional checks (`not_contains`, `flags_present`, `args_match_any`, `all_of`, `any_of`, `not`)
 - `message`: Shown to Claude when command is blocked
 
+The guard reads the project file, else `~/.claude/agent-guard.toml`, else its built-in defaults. A file that exists but cannot be read or parsed denies every Bash command, with a reason naming the file, until it is fixed or removed.
+
 ## Development
 
 ```bash

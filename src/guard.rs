@@ -13,7 +13,7 @@
 //! Configuration is loaded from `.claude/agent-guard.toml` (project-level) or
 //! `~/.claude/agent-guard.toml` (user-level), with embedded defaults as fallback.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::io::Read;
@@ -25,9 +25,9 @@ use std::sync::OnceLock;
 /// Default agent guard configuration embedded in the binary.
 const DEFAULT_CONFIG: &str = include_str!("../.claude/agent-guard.toml");
 
-/// Cached compiled patterns loaded once per process.
-/// This avoids repeated file I/O, TOML parsing, and regex compilation.
-static CACHED_PATTERNS: OnceLock<Vec<CompiledPattern>> = OnceLock::new();
+/// Compiled patterns loaded once per process, or the load error that denies
+/// every command while the policy file is broken.
+static CACHED_PATTERNS: OnceLock<Result<Vec<CompiledPattern>, String>> = OnceLock::new();
 
 /// Agent guard configuration structure (versioned schema).
 /// Fields `schema_version` and `metadata` are deserialized for forward compat
@@ -210,43 +210,36 @@ fn validate_args_match_any(segment: &str, command: &str, values: &[String]) -> b
 
 impl GuardConfig {
     /// Load configuration from the hierarchy: project → user → embedded defaults.
-    pub fn load() -> Self {
-        // Try project-level config first
-        if let Some(config) = Self::load_from_project() {
-            return config;
+    ///
+    /// A missing file falls through to the next level; a file that exists but
+    /// cannot be read or parsed is an error naming its path.
+    pub fn load() -> Result<Self> {
+        if let Some(config) = Self::load_from_file(Path::new(".claude/agent-guard.toml"))? {
+            return Ok(config);
         }
-
-        // Try user-level config
-        if let Some(config) = Self::load_from_user() {
-            return config;
+        // No home directory means there is no user-level policy to read.
+        if let Some(home) = dirs::home_dir() {
+            if let Some(config) = Self::load_from_file(&home.join(".claude/agent-guard.toml"))? {
+                return Ok(config);
+            }
         }
-
-        // Fall back to embedded defaults
         Self::load_from_embedded()
     }
 
-    /// Load config from project-level `.claude/agent-guard.toml`.
-    fn load_from_project() -> Option<Self> {
-        let path = Path::new(".claude/agent-guard.toml");
-        Self::load_from_file(path)
-    }
-
-    /// Load config from user-level `~/.claude/agent-guard.toml`.
-    fn load_from_user() -> Option<Self> {
-        let home = dirs::home_dir()?;
-        let path = home.join(".claude/agent-guard.toml");
-        Self::load_from_file(&path)
-    }
-
     /// Load config from embedded default string.
-    fn load_from_embedded() -> Self {
-        toml::from_str(DEFAULT_CONFIG).expect("BUG: embedded default config is invalid TOML")
+    fn load_from_embedded() -> Result<Self> {
+        toml::from_str(DEFAULT_CONFIG).context("embedded guard policy is invalid TOML")
     }
 
-    /// Load config from a specific file path.
-    fn load_from_file(path: &Path) -> Option<Self> {
-        let contents = std::fs::read_to_string(path).ok()?;
-        toml::from_str(&contents).ok()
+    /// Load config from a specific file path; `Ok(None)` only when it does not exist.
+    fn load_from_file(path: &Path) -> Result<Option<Self>> {
+        let contents = match std::fs::read_to_string(path) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            read => read.with_context(|| format!("cannot read guard policy {}", path.display()))?,
+        };
+        toml::from_str(&contents)
+            .map(Some)
+            .with_context(|| format!("invalid guard policy {}", path.display()))
     }
 
     /// Compile patterns from configuration into regex matchers.
@@ -570,14 +563,24 @@ fn parse_command(input: &str) -> Option<String> {
 // ── Command Evaluation ──────────────────────────────────
 
 /// Evaluate a command string for destructive patterns.
-/// Returns a DenyReason if the command should be blocked, None if safe.
+/// Returns a DenyReason if the command should be blocked or the policy cannot
+/// be loaded, None if safe.
 ///
 /// Patterns are loaded and compiled once, then cached for the lifetime of the process.
 pub fn evaluate_command(command: &str) -> Option<DenyReason> {
     let patterns = CACHED_PATTERNS.get_or_init(|| {
-        let config = GuardConfig::load();
-        config.compile_patterns()
+        GuardConfig::load()
+            .map(GuardConfig::compile_patterns)
+            .map_err(|e| format!("{e:#}"))
     });
+    let patterns = match patterns {
+        Ok(patterns) => patterns,
+        Err(e) => {
+            return Some(DenyReason {
+                reason: format!("agent guard cannot load its policy: {e}. Fix or remove the file."),
+            })
+        }
+    };
 
     for segment in split_compound_command(command) {
         let trimmed = segment.trim();
@@ -1261,7 +1264,7 @@ mod tests {
 
     #[test]
     fn config_loads_embedded_defaults() {
-        let config = GuardConfig::load_from_embedded();
+        let config = GuardConfig::load_from_embedded().unwrap();
         assert_eq!(config.schema_version, "1.0");
         assert!(!config.patterns.is_empty());
 
@@ -1275,8 +1278,27 @@ mod tests {
     }
 
     #[test]
+    fn absent_policy_file_is_no_policy() {
+        let dir = tempfile::tempdir().unwrap();
+        let absent = dir.path().join("agent-guard.toml");
+        assert!(GuardConfig::load_from_file(&absent).unwrap().is_none());
+    }
+
+    #[test]
+    fn present_policy_file_that_cannot_be_read_or_parsed_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let malformed = dir.path().join("agent-guard.toml");
+        std::fs::write(&malformed, "patterns = [ not toml").unwrap();
+        // A directory where the file should be: exists, but unreadable as a file.
+        for path in [malformed, dir.path().to_path_buf()] {
+            let err = GuardConfig::load_from_file(&path).unwrap_err();
+            assert!(format!("{err:#}").contains(&path.display().to_string()));
+        }
+    }
+
+    #[test]
     fn config_default_patterns_are_enabled() {
-        let config = GuardConfig::load();
+        let config = GuardConfig::load().unwrap();
 
         // All default patterns should be enabled
         for pattern in &config.patterns {
@@ -1362,7 +1384,7 @@ message = "TEAM POLICY: No force push ever!"
     #[test]
     fn pattern_registry_covers_all_patterns() {
         // Ensure all expected patterns are in the default config
-        let config = GuardConfig::load_from_embedded();
+        let config = GuardConfig::load_from_embedded().unwrap();
         let pattern_ids: Vec<&str> = config.patterns.iter().map(|p| p.id.as_str()).collect();
 
         assert!(pattern_ids.contains(&"meta.git.force_push"));
