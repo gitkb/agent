@@ -571,7 +571,7 @@ pub fn evaluate_command(command: &str) -> Option<DenyReason> {
     let patterns = CACHED_PATTERNS.get_or_init(|| {
         GuardConfig::load()
             .map(GuardConfig::compile_patterns)
-            .map_err(|e| format!("{e:#}"))
+            .map_err(|e| format!("{e:#}").trim_end().to_string())
     });
     let patterns = match patterns {
         Ok(patterns) => patterns,
